@@ -1,0 +1,1828 @@
+# =============================================================================
+#  TCL heat pump wall thermostat
+#  Waveshare ESP32-S3-Touch-LCD-4.3B (800x480 RGB, GT911 touch, CH422G I/O
+#  expander, onboard RS-485 on GPIO43 RX / GPIO44 TX)
+#
+#  Replaces the TCL wall controller: learns the controller's replies on the
+#  indoor unit's RS-485 bus, then answers the unit's polls itself with the
+#  settings chosen on this touchscreen or in Home Assistant.
+#
+#  See README.md for wiring, the first-time learning procedure and the
+#  Home Assistant setup. Needs ESPHome 2026.1 or newer.
+# =============================================================================
+
+substitutions:
+  name: thermostat
+  friendly_name: Thermostat
+  # Custom fan names exactly as your tcl_bus climate registers them
+  fan_mid_low: "Mid-Low"
+  fan_mid_high: "Mid-High"
+  # Setpoint range in °F (whole degrees). The unit works in 0.5 °C steps
+  # internally; every whole °F from 61 to 88 lands on its own 0.5 °C step
+  # and reads back as the same °F, so the display never drifts.
+  t_min: "61"
+  t_max: "88"
+  # Outdoor temperature from Home Assistant. HA sends the state in the unit
+  # shown on the entity; set this to "true" if that unit is °C.
+  outdoor_entity: sensor.bresser_6in1_0_542115398_temperature
+  outdoor_in_celsius: "false"
+  # Today's forecast high/low: template sensors in Home Assistant (see the
+  # HA snippet that came with this file). Same unit as the outdoor sensor.
+  forecast_high_entity: sensor.forecast_today_high
+  forecast_low_entity: sensor.forecast_today_low
+  # Where the room temperature comes from: the options of
+  # input_select.ac_thermostat_temperature_selector, exactly as in HA.
+  temp_selector: input_select.ac_thermostat_temperature_selector
+  area_1: "1st Floor"
+  area_2: "Bedrooms"
+  area_3: "Whole House"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.1.0
+  on_boot:
+    - priority: -100
+      then:
+        - script.execute: refresh_ui
+        - script.execute: init_settings
+        # Auto-start emulation after a reboot. Listen first: the wall controller
+        # answers every ~1.5–1.9 s, so 10 s is enough to know if it's connected.
+        - delay: 10s
+        - if:
+            condition:
+              lambda: |-
+                return id(auto_emulate).state
+                    && id(tcl).template_count() >= 5
+                    && !id(tcl).controller_present()
+                    && !id(tcl).emulating();
+            then:
+              - lambda: |-
+                  ESP_LOGW("thermostat", "Auto-starting controller emulation (5 templates saved, no wall controller)");
+                  id(tcl).set_emulate(true);
+            else:
+              - lambda: |-
+                  if (!id(auto_emulate).state) return;
+                  if (id(tcl).controller_present())
+                    ESP_LOGW("thermostat", "Not auto-starting emulation: wall controller is on the bus");
+                  else if (id(tcl).template_count() < 5)
+                    ESP_LOGW("thermostat", "Not auto-starting emulation: only %d of 5 templates saved",
+                             (int) id(tcl).template_count());
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: y
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+      # ---- RGB LCD + Wi-Fi coexistence ----
+      # The display's continuous DMA can starve Wi-Fi so the WPA handshake
+      # never completes ("Auth Expired"). Keep the LCD interrupt and the
+      # Wi-Fi/network fast paths in internal RAM.
+      CONFIG_LCD_RGB_ISR_IRAM_SAFE: y
+      CONFIG_LCD_RGB_RESTART_IN_VSYNC: y
+      CONFIG_ESP_WIFI_IRAM_OPT: y
+      CONFIG_ESP_WIFI_RX_IRAM_OPT: y
+      CONFIG_LWIP_IRAM_OPTIMIZATION: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG   # keep logs off GPIO43/44 — those are the RS-485 pins
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+  output_power: 17dB
+  # If Wi-Fi fails, the panel starts its own hotspot so you can still reach it
+  # and enter Wi-Fi details from a phone.
+  ap:
+    ssid: "Thermostat Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# Clock for the night screen-off schedule (time comes from Home Assistant)
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      - script.execute: show_clock
+      - script.execute: check_night
+    on_time:
+      - seconds: 0                     # every minute, on the minute
+        then:
+          - script.execute: show_clock
+
+# -----------------------------------------------------------------------------
+#  1. Board hardware
+# -----------------------------------------------------------------------------
+i2c:
+  id: bus_i2c
+  sda: GPIO8
+  scl: GPIO9
+  frequency: 400kHz
+
+ch422g:
+  - id: ch422g_hub
+
+switch:
+  # ---- emulation on/off (from the test unit) ----
+  - platform: template
+    name: Controller Emulation
+    icon: mdi:remote
+    lambda: return id(tcl).emulating();
+    turn_on_action:
+      - lambda: id(tcl).set_emulate(true);
+    turn_off_action:
+      - lambda: id(tcl).set_emulate(false);
+  - platform: template
+    name: Send HA Room Temperature
+    icon: mdi:home-thermometer
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: return id(tcl).send_room_temp();
+    turn_on_action:
+      - lambda: id(tcl).set_send_room_temp(true);
+    turn_off_action:
+      - lambda: id(tcl).set_send_room_temp(false);
+
+  - platform: template
+    id: auto_emulate
+    name: Auto-start Emulation
+    icon: mdi:restart
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON   # on unless you turn it off in HA
+
+  # ---- screen backlight ----
+  - platform: gpio
+    id: backlight
+    name: Backlight
+    restore_mode: ALWAYS_ON
+    pin:
+      ch422g: ch422g_hub
+      number: 2          # EXIO2 = DISP (backlight enable)
+
+display:
+  # Same pins and timings as ESPHome's ESP32-S3-TOUCH-LCD-4.3 preset, but on
+  # the generic RPI model (no init sequence, no SPI) so EXIO2 stays free for
+  # the backlight switch above, which the screen-sleep timeout uses.
+  - platform: mipi_rgb
+    model: RPI
+    id: main_display
+    update_interval: never
+    auto_clear_enabled: false
+    color_order: RGB
+    pclk_frequency: 16MHz   # panel stays blank at 14MHz; Wi-Fi relies on the IRAM settings in esp32:
+    pclk_inverted: true
+    dimensions:
+      width: 800
+      height: 480
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 3          # EXIO3 = LCD_RST
+    de_pin: GPIO5
+    pclk_pin: GPIO7
+    hsync_pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    vsync_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    hsync_pulse_width: 30
+    hsync_front_porch: 210
+    hsync_back_porch: 30
+    vsync_pulse_width: 4
+    vsync_front_porch: 4
+    vsync_back_porch: 4
+    data_pins:
+      red: [1, 2, 42, 41, 40]          # R3..R7
+      green: [39, 0, 45, 48, 47, 21]   # G2..G7
+      blue: [14, 38, 18, 17, 10]       # B3..B7
+
+touchscreen:
+  - platform: gt911
+    id: main_touch
+    display: main_display
+    interrupt_pin: GPIO4
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 1          # EXIO1 = TP_RST
+    on_touch:
+      # Any touch on the screen saver goes back to the main page at full
+      # brightness. The press lands on the (empty) saver page, so it never
+      # presses a button underneath.
+      - if:
+          condition:
+            lambda: "return id(saver_on);"
+          then:
+            - script.execute: wake_screen
+
+# -----------------------------------------------------------------------------
+#  2. TCL bus — wall-controller emulator (from the working test unit)
+#
+#  This board's onboard RS-485 transceiver (SP3485, auto direction) is on
+#  GPIO43 (RX) / GPIO44 (TX). Set its 120R termination jumper OFF.
+#
+#  HOW IT WORKS
+#    The indoor board polls the wall controller (bus addresses 20:21/23/2A/2C/2D)
+#    and takes its settings from the controller's replies. This device first
+#    LEARNS those replies while the real controller is connected, then (when
+#    "Controller Emulation" is on with the real controller unplugged) answers
+#    the polls itself with the settings chosen on this screen or in HA.
+#
+#  FIRST-TIME PROCEDURE (templates live in this board's flash, so the
+#  test unit's learned templates don't carry over — learn them again here)
+#    1. Wall controller CONNECTED, test unit OFF the bus. Flash this, wait
+#       ~30 s, check "Templates Learned" = 5.
+#    2. Press "Save Controller Templates".
+#    3. Unplug the wall controller. Wait until "Wall Controller Present" = off.
+#    4. Turn on "Controller Emulation".
+#   Until emulation is on, changes from the screen snap back to the
+#   controller's settings.
+# -----------------------------------------------------------------------------
+external_components:
+  - source:
+      type: local
+      path: components          # folder next to this YAML containing tcl_bus/
+    components: [tcl_bus]
+
+uart:
+  id: tcl_uart
+  rx_pin: GPIO43                # RS485_RXD on this board revision
+  tx_pin: GPIO44                # RS485_TXD
+  baud_rate: 9600
+  data_bits: 8
+  parity: EVEN
+  stop_bits: 1
+  rx_buffer_size: 1024
+  rx_full_threshold: 1          # hand over every byte immediately (default 7 delays frame tails and polls)
+  rx_timeout: 1
+
+tcl_bus:
+  id: tcl
+  uart_id: tcl_uart
+  reply_delay: 3ms
+  log_changes: false             # troubleshooting: log bytes that change in the unit's frames
+
+# Thermostat entity: the screen and Home Assistant both control this.
+climate:
+  - platform: tcl_bus
+    id: ac                             # the screen drives this id
+    tcl_bus_id: tcl
+    name: Heat Pump
+    # Use the Home Assistant room sensor as the current temperature, and send it
+    # to the unit in place of the unplugged wall controller's own sensor.
+    room_temperature_sensor: room_temp
+    room_sensor_fahrenheit: false      # sensor.ac_temp_c reports °C
+    on_state:
+      - script.execute: refresh_ui
+
+binary_sensor:
+  - platform: template
+    id: hp_power
+    name: Power
+  - platform: template
+    id: ctrl_present
+    name: Wall Controller Present
+    entity_category: diagnostic
+
+text_sensor:
+  # Which area the room temperature comes from (shown under the setpoint)
+  - platform: homeassistant
+    id: temp_source
+    entity_id: ${temp_selector}
+    internal: true
+    on_value:
+      # Show the current selection in the dropdown under the setpoint
+      - if:
+          condition:
+            lambda: |-
+              return x == "${area_1}" || x == "${area_2}" || x == "${area_3}";
+          then:
+            - lvgl.dropdown.update:
+                id: area_dd
+                selected_index: !lambda |-
+                  if (x == "${area_1}") return 0;
+                  if (x == "${area_2}") return 1;
+                  return 2;
+
+  # ---- network info for the Settings page ----
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+      entity_category: diagnostic
+      on_value:
+        - lvgl.label.update: { id: net_ip, text: !lambda "return x;" }
+    ssid:
+      name: Connected SSID
+      entity_category: diagnostic
+      on_value:
+        - lvgl.label.update: { id: net_ssid, text: !lambda "return x;" }
+    mac_address:
+      name: MAC Address
+      entity_category: diagnostic
+      on_value:
+        - lvgl.label.update: { id: net_mac, text: !lambda "return x;" }
+  - platform: version
+    name: ESPHome Version
+    hide_timestamp: true
+    entity_category: diagnostic
+    on_value:
+      - lvgl.label.update: { id: net_fw, text: !lambda "return x;" }
+
+  - platform: template
+    id: hp_mode
+    name: Mode (reported)
+  - platform: template
+    id: hp_fan
+    name: Fan (reported)
+  - platform: template
+    id: hp_running
+    name: Running Mode
+
+button:
+  - platform: template
+    name: Save Controller Templates
+    icon: mdi:content-save
+    entity_category: config
+    on_press:
+      - lambda: id(tcl).save_templates();
+
+# -----------------------------------------------------------------------------
+#  3. UI state
+# -----------------------------------------------------------------------------
+globals:
+  - id: saver_bright_pct      # screen-saver brightness, set on the Settings page
+    type: int
+    restore_value: true
+    initial_value: "10"
+  - id: night_enabled         # night screen-off schedule on/off
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: night_start_idx       # half-hour slots from midnight: 44 = 10:00 PM
+    type: int
+    restore_value: true
+    initial_value: "44"
+  - id: night_end_idx         # 12 = 6:00 AM
+    type: int
+    restore_value: true
+    initial_value: "12"
+  - id: night_now             # inside the night window right now
+    type: bool
+    initial_value: "false"
+  - id: night_off             # backlight was switched off by the night schedule
+    type: bool
+    initial_value: "false"
+  - id: saver_on              # screen saver showing (display dimmed to 10 %)
+    type: bool
+    initial_value: "false"
+  - id: brightness_pct        # 20–100 %, set on the Settings page
+    type: int
+    restore_value: true
+    initial_value: "100"
+  - id: timeout_idx           # Settings page "Screen off after": index into the list below
+    type: int
+    restore_value: true
+    initial_value: "2"        # 2 minutes
+  - id: ui_sp                 # setpoint shown on screen (whole °F)
+    type: float
+    initial_value: "68.0"
+  - id: sp_hold_until         # while the user is adjusting, ignore bus echoes
+    type: uint32_t
+    initial_value: "0"
+  - id: ui_mode               # 0 off, 1 cool, 2 heat, 3 auto, 4 dry, 5 fan
+    type: int
+    initial_value: "0"
+  - id: ui_fan                # 0 auto,1 quiet,2 low,3 mid-low,4 mid,5 mid-high,6 high,7 turbo
+    type: int
+    initial_value: "-1"
+  - id: ui_tone               # status colour: 0 neutral, 1 cooling, 2 heating
+    type: int
+    initial_value: "0"
+  - id: last_on_mode          # mode the power button turns back on to
+    type: int
+    restore_value: true
+    initial_value: "(int) climate::CLIMATE_MODE_HEAT"
+
+script:
+  # Read the climate entity and redraw everything.
+  - id: refresh_ui
+    mode: restart
+    then:
+      - lambda: |-
+          auto *c = id(ac);
+          int m = 0;
+          switch (c->mode) {
+            case climate::CLIMATE_MODE_COOL:      m = 1; break;
+            case climate::CLIMATE_MODE_HEAT:      m = 2; break;
+            case climate::CLIMATE_MODE_HEAT_COOL:
+            case climate::CLIMATE_MODE_AUTO:      m = 3; break;
+            case climate::CLIMATE_MODE_DRY:       m = 4; break;
+            case climate::CLIMATE_MODE_FAN_ONLY:  m = 5; break;
+            default:                              m = 0; break;
+          }
+          id(ui_mode) = m;
+          if (m != 0) id(last_on_mode) = (int) c->mode;
+
+          int f = -1;
+          if (c->has_custom_fan_mode()) {
+            std::string s(c->get_custom_fan_mode().c_str());
+            if (s == "${fan_mid_low}")  f = 3;
+            if (s == "${fan_mid_high}") f = 5;
+          } else if (c->fan_mode.has_value()) {
+            switch (*c->fan_mode) {
+              case climate::CLIMATE_FAN_AUTO:   f = 0; break;
+              case climate::CLIMATE_FAN_QUIET:  f = 1; break;
+              case climate::CLIMATE_FAN_LOW:    f = 2; break;
+              case climate::CLIMATE_FAN_MEDIUM: f = 4; break;
+              case climate::CLIMATE_FAN_HIGH:   f = 6; break;
+              case climate::CLIMATE_FAN_FOCUS:  f = 7; break;
+              default: break;
+            }
+          }
+          id(ui_fan) = f;
+
+          int tone = 0;
+          if (m != 0) {
+            if (c->action == climate::CLIMATE_ACTION_HEATING) tone = 2;
+            else if (c->action == climate::CLIMATE_ACTION_COOLING) tone = 1;
+          }
+          id(ui_tone) = tone;
+
+          if ((int32_t) (millis() - id(sp_hold_until)) >= 0 && !std::isnan(c->target_temperature))
+            id(ui_sp) = roundf(c->target_temperature * 1.8f + 32.0f);   // °C → °F
+
+      - script.execute: show_sp
+
+      - lvgl.label.update:
+          id: power_lbl
+          text: !lambda 'return id(ui_mode) == 0 ? std::string("Off") : std::string("On");'
+      - lvgl.widget.update:
+          id: btn_power
+          state:
+            checked: !lambda "return id(ui_mode) != 0;"
+
+      # Mode dropdown: Cool, Heat, Auto, Dry, Fan (index = ui_mode - 1).
+      # While off it shows the mode the power button will turn back on to.
+      - lvgl.dropdown.update:
+          id: mode_dd
+          selected_index: !lambda |-
+            int m = id(ui_mode);
+            if (m == 0) {
+              switch ((climate::ClimateMode) id(last_on_mode)) {
+                case climate::CLIMATE_MODE_COOL:      m = 1; break;
+                case climate::CLIMATE_MODE_HEAT_COOL:
+                case climate::CLIMATE_MODE_AUTO:      m = 3; break;
+                case climate::CLIMATE_MODE_DRY:       m = 4; break;
+                case climate::CLIMATE_MODE_FAN_ONLY:  m = 5; break;
+                default:                              m = 2; break;
+              }
+            }
+            return m - 1;
+      - if:
+          condition:
+            lambda: "return id(ui_fan) >= 0;"
+          then:
+            - lvgl.dropdown.update:
+                id: fan_dd
+                selected_index: !lambda "return id(ui_fan);"
+
+      - lvgl.label.update:
+          id: status_lbl
+          text: !lambda |-
+            auto *c = id(ac);
+            if (id(ui_mode) == 0) return std::string("Off");
+            switch (c->action) {
+              case climate::CLIMATE_ACTION_HEATING: return std::string("Heating");
+              case climate::CLIMATE_ACTION_COOLING: return std::string("Cooling");
+              case climate::CLIMATE_ACTION_DRYING:  return std::string("Drying");
+              case climate::CLIMATE_ACTION_FAN:     return std::string("Fan running");
+              case climate::CLIMATE_ACTION_IDLE:    return std::string("Idle");
+              default: break;
+            }
+            static const char *const names[] = {"Off", "Cool", "Heat", "Auto", "Dry", "Fan"};
+            return std::string(names[id(ui_mode)]) + " mode";
+      - lvgl.widget.update:
+          id: status_lbl
+          state:
+            checked: !lambda "return id(ui_tone) == 1;"
+            user_1: !lambda "return id(ui_tone) == 2;"
+
+      - script.execute: show_room
+      - script.execute: show_bg
+      - script.execute: show_saver
+
+  # Push ui_sp to the big number and the dial, and tint the dial by mode.
+  - id: show_sp
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: sp_label
+          text:
+            format: "%.0f°"
+            args: ["id(ui_sp)"]
+      - lvgl.arc.update:
+          id: sp_arc
+          value: !lambda "return (int) lroundf(id(ui_sp));"
+          state:
+            checked: !lambda "return id(ui_mode) == 1;"
+            user_1: !lambda "return id(ui_mode) == 2;"
+            user_2: !lambda "return id(ui_mode) == 3;"
+            user_3: !lambda "return id(ui_mode) == 4;"
+            user_4: !lambda "return id(ui_mode) == 5;"
+
+  # +/- buttons: update the screen at once, send to the unit after a pause.
+  - id: bump_sp
+    mode: queued
+    max_runs: 4
+    parameters:
+      delta: float
+    then:
+      - lambda: |-
+          float v = roundf(id(ui_sp) + delta);
+          id(ui_sp) = std::max((float) ${t_min}, std::min((float) ${t_max}, v));
+          id(sp_hold_until) = millis() + 4000;
+      - script.execute: show_sp
+      - script.execute: commit_sp
+
+  - id: commit_sp
+    mode: restart
+    then:
+      - delay: 700ms
+      - climate.control:
+          id: ac
+          # °F → °C, snapped to the unit's 0.5 °C step
+          target_temperature: !lambda "return roundf((id(ui_sp) - 32.0f) / 1.8f * 2.0f) / 2.0f;"
+      - lambda: "id(sp_hold_until) = millis() + 2500;"
+
+  # Settings: restore saved brightness/timeout into the controls and apply them.
+  - id: init_settings
+    then:
+      - lvgl.slider.update:
+          id: bright_slider
+          value: !lambda "return id(brightness_pct);"
+      - lvgl.dropdown.update:
+          id: timeout_dd
+          selected_index: !lambda "return id(timeout_idx);"
+      - lvgl.slider.update:
+          id: saver_bright_slider
+          value: !lambda "return id(saver_bright_pct);"
+      - lvgl.dropdown.update:
+          id: night_start_dd
+          selected_index: !lambda "return id(night_start_idx);"
+      - lvgl.dropdown.update:
+          id: night_end_dd
+          selected_index: !lambda "return id(night_end_idx);"
+      - lvgl.widget.update:
+          id: night_sw
+          state:
+            checked: !lambda "return id(night_enabled);"
+      - script.execute: apply_brightness
+
+  # Brightness = a black overlay on the top layer (the backlight is on/off only).
+  - id: apply_brightness
+    mode: restart
+    then:
+      - lvgl.widget.update:
+          id: dim_layer
+          # 10 % while the screen saver runs, otherwise the Settings brightness
+          bg_opa: !lambda |-
+            int pct = id(saver_on) ? id(saver_bright_pct) : id(brightness_pct);
+            return (lv_opa_t) ((100 - pct) * 255 / 100);
+      - lvgl.label.update:
+          id: bright_val
+          text:
+            format: "%d%%"
+            args: ["id(brightness_pct)"]
+      - lvgl.label.update:
+          id: saver_bright_val
+          text:
+            format: "%d%%"
+            args: ["id(saver_bright_pct)"]
+
+  # Idle: show the bouncing-temperature screen saver at 10 % brightness.
+  - id: start_saver
+    then:
+      - lambda: "id(saver_on) = true;"
+      - script.execute: show_saver
+      - lvgl.page.show: saver_page
+      - script.execute: apply_brightness
+      # At night the screen goes fully off instead
+      - if:
+          condition:
+            lambda: "return id(night_now);"
+          then:
+            - lambda: "id(night_off) = true;"
+            - switch.turn_off: backlight
+
+  # Touch: back to the main page at the normal brightness.
+  - id: wake_screen
+    then:
+      - lambda: "id(saver_on) = false;"
+      - lvgl.page.show: main_page
+      - script.execute: apply_brightness
+      - if:
+          condition:
+            lambda: "return id(night_off) || !id(backlight).state;"
+          then:
+            - lambda: "id(night_off) = false;"
+            - switch.turn_on: backlight
+
+  # Night schedule: work out whether we're inside the off window, then turn
+  # the screen off (if it's idle) or back on when the window ends.
+  - id: check_night
+    mode: restart
+    then:
+      - lambda: |-
+          bool n = false;
+          auto t = id(ha_time).now();
+          if (id(night_enabled) && t.is_valid()) {
+            int m = t.hour * 60 + t.minute;
+            int s = id(night_start_idx) * 30, e = id(night_end_idx) * 30;
+            if (s != e)
+              n = (s < e) ? (m >= s && m < e) : (m >= s || m < e);   // window may cross midnight
+          }
+          id(night_now) = n;
+      - if:
+          condition:
+            lambda: "return id(night_now) && id(saver_on) && !id(night_off);"
+          then:
+            - lambda: "id(night_off) = true;"
+            - switch.turn_off: backlight
+      - if:
+          condition:
+            lambda: "return !id(night_now) && id(night_off);"
+          then:
+            - lambda: "id(night_off) = false;"
+            - switch.turn_on: backlight
+
+  # Screen-saver text and colour: room temperature, mode and setpoint.
+  - id: show_saver
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: saver_temp
+          text: !lambda |-
+            float t = id(room_temp).state;
+            if (std::isnan(t)) t = id(ac).current_temperature;
+            if (std::isnan(t)) return std::string("--");
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%.0f°", t * 1.8f + 32.0f);
+            return std::string(buf);
+      - lvgl.label.update:
+          id: saver_sub
+          text: !lambda |-
+            static const char *const names[] = {"Off", "Cool", "Heat", "Auto", "Dry", "Fan"};
+            int m = id(ui_mode);
+            if (m == 0) return std::string("Off");
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%s  ·  set %.0f°", names[m], id(ui_sp));
+            return std::string(buf);
+      - lvgl.widget.update:
+          id: saver_temp
+          state:
+            checked: !lambda "return id(ui_mode) == 1;"
+            user_1: !lambda "return id(ui_mode) == 2;"
+            user_2: !lambda "return id(ui_mode) == 3;"
+            user_3: !lambda "return id(ui_mode) == 4;"
+            user_4: !lambda "return id(ui_mode) == 5;"
+
+  # Main-page background colour follows the mode.
+  - id: show_bg
+    mode: restart
+    then:
+      - lvgl.widget.update:
+          id: page_bg
+          state:
+            checked: !lambda "return id(ui_mode) == 1;"
+            user_1: !lambda "return id(ui_mode) == 2;"
+            user_2: !lambda "return id(ui_mode) == 3;"
+            user_3: !lambda "return id(ui_mode) == 4;"
+            user_4: !lambda "return id(ui_mode) == 5;"
+
+  # Mode dropdown → climate. Index: 0 Cool, 1 Heat, 2 Auto, 3 Dry, 4 Fan.
+  - id: set_mode
+    parameters:
+      idx: int
+    then:
+      - climate.control:
+          id: ac
+          mode: !lambda |-
+            switch (idx) {
+              case 0: return climate::CLIMATE_MODE_COOL;
+              case 1: return climate::CLIMATE_MODE_HEAT;
+              case 2: return id(ac).get_traits().supports_mode(climate::CLIMATE_MODE_HEAT_COOL)
+                          ? climate::CLIMATE_MODE_HEAT_COOL : climate::CLIMATE_MODE_AUTO;
+              case 3: return climate::CLIMATE_MODE_DRY;
+              default: return climate::CLIMATE_MODE_FAN_ONLY;
+            }
+
+  # Fan dropdown → climate. Mid-Low and Mid-High are custom fan modes.
+  - id: set_fan
+    parameters:
+      idx: int
+    then:
+      - if:
+          condition:
+            lambda: "return idx == 3;"
+          then:
+            - climate.control: { id: ac, custom_fan_mode: "${fan_mid_low}" }
+          else:
+            - if:
+                condition:
+                  lambda: "return idx == 5;"
+                then:
+                  - climate.control: { id: ac, custom_fan_mode: "${fan_mid_high}" }
+                else:
+                  - climate.control:
+                      id: ac
+                      fan_mode: !lambda |-
+                        switch (idx) {
+                          case 0: return climate::CLIMATE_FAN_AUTO;
+                          case 1: return climate::CLIMATE_FAN_QUIET;
+                          case 2: return climate::CLIMATE_FAN_LOW;
+                          case 4: return climate::CLIMATE_FAN_MEDIUM;
+                          case 6: return climate::CLIMATE_FAN_HIGH;
+                          default: return climate::CLIMATE_FAN_FOCUS;
+                        }
+
+  # Room reading under the setpoint: sensor.ac_temp_c (°C) shown in °F.
+  # Falls back to the climate entity's current temperature until HA connects.
+  - id: show_room
+    then:
+      - lvgl.label.update:
+          id: room_label
+          text: !lambda |-
+            // Temperature only; the area is shown in the dropdown next to it.
+            float t = id(room_temp).state;
+            if (std::isnan(t)) t = id(ac).current_temperature;
+            if (std::isnan(t)) return std::string("--");
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%.0f°F", t * 1.8f + 32.0f);
+            return std::string(buf);
+
+  # Clock on the main page (12-hour, from Home Assistant's time)
+  - id: show_clock
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: clock_lbl
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return std::string("");
+            int h = t.hour % 12;
+            if (h == 0) h = 12;
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%d:%02d %s", h, t.minute, t.hour < 12 ? "AM" : "PM");
+            return std::string(buf);
+
+  - id: show_forecast
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: fc_high
+          text: !lambda |-
+            float t = id(fc_high_sensor).state;
+            if (std::isnan(t)) return std::string("H --");
+            if (${outdoor_in_celsius}) t = t * 1.8f + 32.0f;
+            char buf[12];
+            snprintf(buf, sizeof(buf), "H %.0f°", t);
+            return std::string(buf);
+      - lvgl.label.update:
+          id: fc_low
+          text: !lambda |-
+            float t = id(fc_low_sensor).state;
+            if (std::isnan(t)) return std::string("L --");
+            if (${outdoor_in_celsius}) t = t * 1.8f + 32.0f;
+            char buf[12];
+            snprintf(buf, sizeof(buf), "L %.0f°", t);
+            return std::string(buf);
+
+  - id: show_outdoor
+    then:
+      - lvgl.label.update:
+          id: outdoor_lbl
+          text: !lambda |-
+            float t = id(outdoor_temp).state;
+            if (std::isnan(t)) return std::string("--");
+            if (${outdoor_in_celsius}) t = t * 1.8f + 32.0f;
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%.0f°F", t);
+            return std::string(buf);
+
+sensor:
+  # Room temperature from Home Assistant: shown as the thermostat's current temperature,
+  # and sent to the unit in place of the wall controller's sensor while emulating.
+  - platform: homeassistant
+    id: room_temp
+    name: Room Temperature (from HA)
+    entity_id: sensor.ac_temp_c
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    internal: true                     # already in HA; don't publish a duplicate
+    on_value:
+      - script.execute: show_room
+      - script.execute: show_saver
+
+  # ---- decoded bus values (from the test unit) ----
+  - platform: template
+    id: hp_set
+    name: Target Temperature (reported)
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    filters: [delta: 0.05]
+  - platform: template
+    id: hp_set_raw
+    name: Setpoint (raw)
+    accuracy_decimals: 0
+    filters: [delta: 0.5]
+  - platform: template
+    id: hp_room
+    name: Controller Room Temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    filters: [delta: 0.05]
+  - platform: template
+    id: hp_fan_out
+    name: Indoor Fan Output
+    accuracy_decimals: 0
+    filters: [delta: 0.5]
+  - platform: template
+    id: hp_coil
+    name: Indoor Coil Temperature      # fan starts in heat once this reaches ~36 °C
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 1
+    filters: [delta: 0.05]
+  - platform: template
+    id: hp_comp
+    name: Compressor Demand (raw)      # 0 when the compressor is off
+    accuracy_decimals: 0
+    filters: [delta: 0.5]
+  - platform: template
+    id: tpl_count
+    name: Templates Learned
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters: [delta: 0.5]
+  - platform: template
+    id: sent_count
+    name: Replies Sent
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters: [throttle: 30s]
+  - platform: template
+    id: noisy_count
+    name: Noisy Polls Answered
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters: [throttle: 30s]
+  - platform: template
+    id: ok_count
+    name: Valid Frames
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters: [throttle: 30s]
+  - platform: template
+    id: bad_count
+    name: Bad Frames
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    filters: [throttle: 30s]
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: WiFi Signal
+    update_interval: 30s
+    on_value:
+      - lvgl.label.update:
+          id: net_signal
+          text:
+            format: "%.0f dBm"
+            args: ["x"]
+
+  # Outdoor temperature from the Bresser 6-in-1 weather station
+  - platform: homeassistant
+    id: outdoor_temp
+    entity_id: ${outdoor_entity}
+    internal: true
+    on_value:
+      - script.execute: show_outdoor
+
+  # Today's forecast high / low (template sensors in Home Assistant)
+  - platform: homeassistant
+    id: fc_high_sensor
+    entity_id: ${forecast_high_entity}
+    internal: true
+    on_value:
+      - script.execute: show_forecast
+  - platform: homeassistant
+    id: fc_low_sensor
+    entity_id: ${forecast_low_entity}
+    internal: true
+    on_value:
+      - script.execute: show_forecast
+
+interval:
+  # ---- decode bus frames into HA entities (from the test unit) ----
+  - interval: 1s
+    then:
+      - lambda: |-
+          // raw = (°C + 30) * 10  (510 = 21.0 °C)
+          auto to_c = [](uint16_t raw) -> float { return raw / 10.0f - 30.0f; };
+
+          id(ctrl_present).publish_state(id(tcl).controller_present());
+          id(tpl_count).publish_state(id(tcl).template_count());
+          id(sent_count).publish_state(id(tcl).replies_sent);
+          id(noisy_count).publish_state(id(tcl).noisy_polls);
+          id(ok_count).publish_state(id(tcl).frames_ok);
+          id(bad_count).publish_state(id(tcl).frames_bad);
+
+          static const char *modes[] = {"off", "cool", "dry", "fan_only", "heat", "?", "?", "?", "auto"};
+          static const char *fans[] = {"auto", "low", "mid", "high", "mute", "strong", "mid-low", "mid-high"};
+
+          auto *s = id(tcl).frame(0x20, 0x23);          // controller settings (real or ours)
+          if (s != nullptr && s->size() >= 85) {
+            auto &f = *s;
+            bool power = f[72] & 0x80;
+            uint8_t m = f[72] & 0x0F;
+            id(hp_power).publish_state(power);
+            std::string mode = power ? (m <= 8 ? modes[m] : "?") : "off";
+            if (id(hp_mode).state != mode) id(hp_mode).publish_state(mode);
+            std::string fan = fans[(f[75] >> 5) & 7];
+            if (id(hp_fan).state != fan) id(hp_fan).publish_state(fan);
+            id(hp_set).publish_state(to_c((f[73] << 8) | f[74]));
+            id(hp_set_raw).publish_state((f[73] << 8) | f[74]);
+            id(hp_room).publish_state(to_c((f[81] << 8) | f[82]));
+          }
+          auto *st = id(tcl).frame(0x10, 0x13);         // indoor unit status
+          if (st != nullptr && st->size() >= 123) {
+            auto &f = *st;
+            std::string run;
+            switch (f[72] & 0x07) {
+              case 1: run = "cool"; break;
+              case 2: run = "dry"; break;
+              case 3: run = "fan"; break;
+              case 4: run = "heat"; break;
+              default: run = "idle"; break;
+            }
+            if (!(f[72] & 0x80)) run = "off";
+            if (id(hp_running).state != run) id(hp_running).publish_state(run);
+            id(hp_fan_out).publish_state(f[96]);
+            id(hp_coil).publish_state(to_c((f[85] << 8) | f[86]));   // indoor coil temperature
+            id(hp_comp).publish_state(f[51]);                           // rises when the compressor runs
+          }
+
+  # ---- screen saver: bounce the temperature around the screen ----
+  - interval: 40ms
+    then:
+      - if:
+          condition:
+            lambda: "return id(saver_on) && !id(night_off);"
+          then:
+            - lambda: |-
+                // saver_box is 340 x 170 on an 800 x 480 screen
+                static float x = 230, y = 155, dx = 1.6f, dy = 1.2f;
+                x += dx; y += dy;
+                if (x <= 0)   { x = 0;   dx = -dx; }
+                if (x >= 460) { x = 460; dx = -dx; }
+                if (y <= 0)   { y = 0;   dy = -dy; }
+                if (y >= 310) { y = 310; dy = -dy; }
+                lv_obj_set_pos(id(saver_box), (int32_t) x, (int32_t) y);
+
+  # ---- night screen-off schedule ----
+  - interval: 30s
+    then:
+      - script.execute: check_night
+
+  # ---- Home Assistant link icon ----
+  - interval: 5s
+    then:
+      - if:
+          condition: api.connected
+          then:
+            - lvgl.widget.update:
+                id: link_icon
+                state: { checked: true }
+            - lvgl.label.update: { id: net_ha, text: "Connected" }
+          else:
+            - lvgl.widget.update:
+                id: link_icon
+                state: { checked: false }
+            - lvgl.label.update: { id: net_ha, text: "Not connected" }
+
+# -----------------------------------------------------------------------------
+#  4. Fonts
+# -----------------------------------------------------------------------------
+font:
+  - file: "gfonts://Inter@300"
+    id: f_setpoint
+    size: 104
+    bpp: 4
+    glyphs: "0123456789.-°"
+  - file: "gfonts://Inter@300"
+    id: f_outdoor
+    size: 48
+    bpp: 4
+    glyphs: "0123456789.-°F"
+  - file: "gfonts://Inter@600"
+    id: f_title
+    size: 26
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+  - file: "gfonts://Inter@400"
+    id: f_body
+    size: 22
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+  - file: "gfonts://Inter@600"
+    id: f_small
+    size: 18
+    bpp: 4
+    glyphsets: [GF_Latin_Core]
+
+# -----------------------------------------------------------------------------
+#  5. Screen layout (800 x 480)
+#
+#   ┌──────────────────────────────────────────────────────────────┐
+#   │ ⚙                         7:41 AM             Heating   wifi │
+#   │      ╭──────────────╮        [   ⏻  On                   ]  │
+#   │    ╱     SET TO     ╲        MODE                           │
+#   │   │       70°        │       [ Heat                    ▾ ]  │
+#   │    ╲ 68°F [Whole House▾]╱       FAN                            │
+#   │        ( − )  ( + )          [ Auto                    ▾ ]  │
+#   │                              ┌ OUTDOOR ─────────────────┐   │
+#   │                              │ H 52°  L 38°       48°F │   │
+#   │                              └──────────────────────────┘   │
+#   └──────────────────────────────────────────────────────────────┘
+# -----------------------------------------------------------------------------
+lvgl:
+  displays: [main_display]
+  touchscreens: [main_touch]
+  buffer_size: 15%           # smaller draw buffer = less PSRAM contention with Wi-Fi
+  default_font: f_body
+
+  on_idle:
+    # "Screen saver after" on the Settings page; index 5 = Never
+    timeout: !lambda |-
+      static const uint32_t ms[] = {30000, 60000, 120000, 300000, 600000};
+      int i = id(timeout_idx);
+      if (i >= 0 && i < 5) return ms[i];
+      return id(night_now) ? 60000u : UINT32_MAX;   // "Never": still turn off at night after 1 min
+    then:
+      - if:
+          condition:
+            lambda: "return !id(saver_on);"
+          then:
+            - script.execute: start_saver
+
+  # Brightness overlay: covers every page, never takes touches.
+  top_layer:
+    widgets:
+      - obj:
+          id: dim_layer
+          x: 0
+          y: 0
+          width: 800
+          height: 480
+          bg_color: 0x000000
+          bg_opa: TRANSP
+          clickable: false
+          scrollable: false
+
+  theme:
+    label:
+      text_color: 0xE8EAED
+    button:
+      bg_color: 0x22262E
+      bg_opa: COVER
+      text_color: 0xD7DAE0
+      radius: 14
+      border_width: 0
+      shadow_width: 0
+      pressed:
+        bg_color: 0x30353F
+      checked:
+        bg_color: 0x3B82F6
+        text_color: 0xFFFFFF
+    obj:
+      bg_opa: TRANSP
+      border_width: 0
+      pad_all: 0
+      radius: 0
+
+  style_definitions:
+    - id: dd_style              # closed dropdown
+      bg_color: 0x22262E
+      bg_opa: COVER
+      border_width: 0
+      radius: 14
+      text_color: 0xE8EAED
+      text_font: f_body
+      pad_left: 18
+      pad_right: 18
+      pad_top: 14
+    - id: dd_list_style         # open list
+      bg_color: 0x22262E
+      bg_opa: COVER
+      border_width: 1
+      border_color: 0x30353F
+      radius: 14
+      text_color: 0xD7DAE0
+      text_font: f_body
+      text_line_space: 22
+      pad_all: 14
+      max_height: 320
+
+  pages:
+    - id: main_page
+      bg_color: 0x0F1115
+      bg_opa: COVER
+      scrollable: false        # otherwise LVGL can read taps as scroll gestures
+      scrollbar_mode: "OFF"
+      widgets:
+        # ---- mode-coloured background (drawn first, behind everything) ----
+        - obj:
+            id: page_bg
+            x: 0
+            y: 0
+            width: 800
+            height: 480
+            bg_color: 0x0F1115        # off
+            bg_opa: COVER
+            clickable: false
+            scrollable: false
+            checked:
+              bg_color: 0x0B1A30      # cool: deep blue
+            user_1:
+              bg_color: 0x2A1508      # heat: deep amber
+            user_2:
+              bg_color: 0x1D1233      # auto: deep violet
+            user_3:
+              bg_color: 0x08241F      # dry: deep teal
+            user_4:
+              bg_color: 0x161C26      # fan: slate
+
+        # ---- top bar ------------------------------------------------------
+        - button:
+            id: btn_settings
+            x: 16
+            y: 10
+            width: 56
+            height: 48
+            bg_opa: TRANSP
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\uF013"         # gear
+                  text_font: montserrat_24
+                  text_color: 0x9AA0A6
+            on_click:
+              - lvgl.page.show: settings_page
+        - label:
+            id: clock_lbl
+            align: TOP_MID
+            y: 18
+            text: ""
+            text_font: f_title
+            text_color: 0xE8EAED
+        - label:
+            id: status_lbl
+            align: TOP_RIGHT
+            x: -66
+            y: 22
+            text: "..."
+            text_color: 0x9AA0A6
+            checked:
+              text_color: 0x60A5FA
+            user_1:
+              text_color: 0xFB923C
+        - label:
+            id: link_icon
+            align: TOP_RIGHT
+            x: -28
+            y: 24
+            text: "\uF1EB"            # wifi symbol: green when HA is connected
+            text_font: montserrat_20
+            text_color: 0x5F6368
+            checked:
+              text_color: 0x34D399
+
+        # ---- setpoint dial -----------------------------------------------
+        - obj:
+            id: dial
+            x: 65
+            y: 108
+            width: 340
+            height: 340
+            scrollable: false
+            scrollbar_mode: "OFF"
+            widgets:
+              - arc:
+                  id: sp_arc
+                  align: CENTER
+                  width: 340
+                  height: 340
+                  min_value: ${t_min}
+                  max_value: ${t_max}
+                  value: 68
+                  rotation: 135
+                  start_angle: 0
+                  end_angle: 270
+                  adjustable: true
+                  arc_width: 22
+                  arc_color: 0x22262E
+                  arc_rounded: true
+                  indicator:
+                    arc_width: 22
+                    arc_rounded: true
+                    arc_color: 0x5F6368      # off
+                    checked:
+                      arc_color: 0x3B82F6    # cool
+                    user_1:
+                      arc_color: 0xF97316    # heat
+                    user_2:
+                      arc_color: 0xA855F7    # auto
+                    user_3:
+                      arc_color: 0x14B8A6    # dry
+                    user_4:
+                      arc_color: 0x94A3B8    # fan
+                  knob:
+                    bg_color: 0xFFFFFF
+                    pad_all: 5
+                  on_value:
+                    - lambda: |-
+                        id(ui_sp) = (float) x;
+                        id(sp_hold_until) = millis() + 4000;
+                    - lvgl.label.update:
+                        id: sp_label
+                        text:
+                          format: "%.0f°"
+                          args: ["id(ui_sp)"]
+                  on_release:
+                    - script.execute: commit_sp
+              - label:
+                  align: CENTER
+                  y: -80
+                  text: "SET TO"
+                  text_font: f_small
+                  text_color: 0x9AA0A6
+              - label:
+                  id: sp_label
+                  align: CENTER
+                  y: -8
+                  text: "--"
+                  text_font: f_setpoint
+              # Room temperature + where it comes from (tap to change)
+              - obj:
+                  align: CENTER
+                  y: 72
+                  width: 300
+                  height: 40
+                  scrollable: false
+                  layout:
+                    type: FLEX
+                    flex_flow: ROW
+                    flex_align_main: CENTER
+                    flex_align_cross: CENTER
+                    flex_align_track: CENTER
+                    pad_column: 10
+                  widgets:
+                    - label:
+                        id: room_label
+                        text: "--"
+                        text_color: 0x9AA0A6
+                    - dropdown:
+                        id: area_dd
+                        width: 176
+                        height: 40
+                        options: ["${area_1}", "${area_2}", "${area_3}"]
+                        selected_index: 2
+                        bg_color: 0x22262E
+                        bg_opa: COVER
+                        border_width: 0
+                        radius: 20
+                        text_color: 0xE8EAED
+                        text_font: f_small
+                        pad_left: 14
+                        pad_right: 12
+                        pad_top: 10
+                        symbol: "\uF078"
+                        indicator:
+                          text_font: montserrat_14
+                          text_color: 0x9AA0A6
+                        dropdown_list:
+                          styles: dd_list_style
+                          selected:
+                            bg_color: 0x30353F
+                            checked:
+                              bg_color: 0x3B82F6
+                              text_color: 0xFFFFFF
+                        on_change:
+                          # Set the selector in Home Assistant; HA then
+                          # recalculates sensor.ac_temp_c for that area.
+                          - homeassistant.action:
+                              action: input_select.select_option
+                              data:
+                                entity_id: ${temp_selector}
+                                option: !lambda |-
+                                  static const char *const o[] = {"${area_1}", "${area_2}", "${area_3}"};
+                                  return std::string(o[x < 3 ? x : 2]);
+              - button:
+                  id: btn_minus
+                  align: BOTTOM_MID
+                  x: -72
+                  width: 68
+                  height: 68
+                  radius: 34
+                  widgets:
+                    - label:
+                        align: CENTER
+                        text: "\uF068"
+                        text_font: montserrat_28
+                  on_click:
+                    - script.execute: { id: bump_sp, delta: -1.0 }
+                  on_long_press_repeat:
+                    - script.execute: { id: bump_sp, delta: -1.0 }
+              - button:
+                  id: btn_plus
+                  align: BOTTOM_MID
+                  x: 72
+                  width: 68
+                  height: 68
+                  radius: 34
+                  widgets:
+                    - label:
+                        align: CENTER
+                        text: "\uF067"
+                        text_font: montserrat_28
+                  on_click:
+                    - script.execute: { id: bump_sp, delta: 1.0 }
+                  on_long_press_repeat:
+                    - script.execute: { id: bump_sp, delta: 1.0 }
+
+        # ---- power --------------------------------------------------------
+        - button:
+            id: btn_power
+            x: 490
+            y: 76
+            width: 282
+            height: 64
+            checked:
+              bg_color: 0x16A34A
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: CENTER
+              flex_align_cross: CENTER
+              flex_align_track: CENTER
+              pad_column: 12
+            widgets:
+              - label:
+                  text: "\uF011"
+                  text_font: montserrat_24
+              - label:
+                  id: power_lbl
+                  text: "Off"
+                  text_font: f_title
+            on_click:
+              - climate.control:
+                  id: ac
+                  mode: !lambda |-
+                    if (id(ac).mode == climate::CLIMATE_MODE_OFF)
+                      return (climate::ClimateMode) id(last_on_mode);
+                    return climate::CLIMATE_MODE_OFF;
+
+        # ---- mode ---------------------------------------------------------
+        - label:
+            x: 494
+            y: 154
+            text: "MODE"
+            text_font: f_small
+            text_color: 0x9AA0A6
+        - dropdown:
+            id: mode_dd
+            x: 490
+            y: 178
+            width: 282
+            height: 56
+            options: [Cool, Heat, Auto, Dry, Fan]
+            selected_index: 1
+            styles: dd_style
+            symbol: "\uF078"
+            indicator:
+              text_font: montserrat_18
+              text_color: 0x9AA0A6
+            dropdown_list:
+              styles: dd_list_style
+              selected:
+                bg_color: 0x30353F
+                checked:
+                  bg_color: 0x3B82F6
+                  text_color: 0xFFFFFF
+            on_change:
+              - script.execute:
+                  id: set_mode
+                  idx: !lambda "return x;"
+
+        # ---- fan speed ----------------------------------------------------
+        - label:
+            x: 494
+            y: 250
+            text: "FAN"
+            text_font: f_small
+            text_color: 0x9AA0A6
+        - dropdown:
+            id: fan_dd
+            x: 490
+            y: 274
+            width: 282
+            height: 56
+            options: [Auto, Quiet, Low, Mid-Low, Medium, Mid-High, High, Turbo]
+            selected_index: 0
+            styles: dd_style
+            symbol: "\uF078"
+            indicator:
+              text_font: montserrat_18
+              text_color: 0x9AA0A6
+            dropdown_list:
+              styles: dd_list_style
+              selected:
+                bg_color: 0x30353F
+                checked:
+                  bg_color: 0x3B82F6
+                  text_color: 0xFFFFFF
+            on_change:
+              - script.execute:
+                  id: set_fan
+                  idx: !lambda "return x;"
+
+        # ---- outdoor temperature (Home Assistant) -------------------------
+        - obj:
+            x: 490
+            y: 350
+            width: 282
+            height: 96
+            bg_color: 0x171A20
+            bg_opa: COVER
+            radius: 14
+            scrollable: false
+            widgets:
+              - label:
+                  x: 18
+                  y: 16
+                  text: "OUTDOOR"
+                  text_font: f_small
+                  text_color: 0x9AA0A6
+              # today's forecast, under the OUTDOOR heading
+              - label:
+                  id: fc_high
+                  x: 18
+                  y: 52
+                  text: "H --"
+                  text_font: f_small
+                  text_color: 0xFB923C
+              - label:
+                  id: fc_low
+                  x: 92
+                  y: 52
+                  text: "L --"
+                  text_font: f_small
+                  text_color: 0x60A5FA
+              - label:
+                  id: outdoor_lbl
+                  align: RIGHT_MID
+                  x: -20
+                  text: "--"
+                  text_font: f_outdoor
+
+    # =================================================================
+    #  Settings page
+    # =================================================================
+    - id: settings_page
+      bg_color: 0x0F1115
+      bg_opa: COVER
+      scrollable: true           # swipe up for the night schedule
+      scroll_dir: VER
+      scrollbar_mode: AUTO
+      widgets:
+        - button:
+            x: 16
+            y: 10
+            width: 128
+            height: 48
+            bg_opa: TRANSP
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: START
+              flex_align_cross: CENTER
+              flex_align_track: CENTER
+              pad_column: 10
+            widgets:
+              - label:
+                  text: "\uF053"       # chevron left
+                  text_font: montserrat_20
+                  text_color: 0x9AA0A6
+              - label:
+                  text: "Back"
+                  text_color: 0xD7DAE0
+            on_click:
+              - lvgl.page.show: main_page
+        - label:
+            align: TOP_MID
+            y: 20
+            text: "Settings"
+            text_font: f_title
+
+        # ---- display card ----------------------------------------------
+        - obj:
+            x: 24
+            y: 80
+            width: 368
+            height: 376
+            bg_color: 0x171A20
+            bg_opa: COVER
+            radius: 16
+            scrollable: false
+            widgets:
+              - label:
+                  x: 20
+                  y: 18
+                  text: "DISPLAY"
+                  text_font: f_small
+                  text_color: 0x9AA0A6
+              - label:
+                  x: 20
+                  y: 60
+                  text: "Brightness"
+              - label:
+                  id: bright_val
+                  align: TOP_RIGHT
+                  x: -20
+                  y: 60
+                  text: "100%"
+                  text_color: 0x9AA0A6
+              - slider:
+                  id: bright_slider
+                  x: 28
+                  y: 108
+                  width: 312
+                  height: 12
+                  min_value: 20
+                  max_value: 100
+                  value: 100
+                  bg_color: 0x22262E
+                  bg_opa: COVER
+                  radius: 6
+                  indicator:
+                    bg_color: 0x3B82F6
+                    radius: 6
+                  knob:
+                    bg_color: 0xFFFFFF
+                    pad_all: 9
+                    radius: 20
+                  on_value:
+                    - lambda: "id(brightness_pct) = (int) x;"
+                    - script.execute: apply_brightness
+              - label:
+                  x: 20
+                  y: 160
+                  text: "Screen saver after"
+              - dropdown:
+                  id: timeout_dd
+                  x: 20
+                  y: 196
+                  width: 328
+                  height: 56
+                  options: [30 seconds, 1 minute, 2 minutes, 5 minutes, 10 minutes, Never]
+                  selected_index: 2
+                  styles: dd_style
+                  symbol: "\uF078"
+                  indicator:
+                    text_font: montserrat_18
+                    text_color: 0x9AA0A6
+                  dropdown_list:
+                    styles: dd_list_style
+                    selected:
+                      bg_color: 0x30353F
+                      checked:
+                        bg_color: 0x3B82F6
+                        text_color: 0xFFFFFF
+                  on_change:
+                    - lambda: "id(timeout_idx) = x;"
+              - label:
+                  x: 20
+                  y: 274
+                  text: "Screen saver brightness"
+              - label:
+                  id: saver_bright_val
+                  align: TOP_RIGHT
+                  x: -20
+                  y: 274
+                  text: "10%"
+                  text_color: 0x9AA0A6
+              - slider:
+                  id: saver_bright_slider
+                  x: 28
+                  y: 322
+                  width: 312
+                  height: 12
+                  min_value: 5
+                  max_value: 60
+                  value: 10
+                  bg_color: 0x22262E
+                  bg_opa: COVER
+                  radius: 6
+                  indicator:
+                    bg_color: 0x3B82F6
+                    radius: 6
+                  knob:
+                    bg_color: 0xFFFFFF
+                    pad_all: 9
+                    radius: 20
+                  on_value:
+                    - lambda: "id(saver_bright_pct) = (int) x;"
+                    - script.execute: apply_brightness
+
+        # ---- network card ----------------------------------------------
+        - obj:
+            x: 408
+            y: 80
+            width: 368
+            height: 376
+            bg_color: 0x171A20
+            bg_opa: COVER
+            radius: 16
+            scrollable: false
+            widgets:
+              - label: { x: 20, y: 18, text: "NETWORK", text_font: f_small, text_color: 0x9AA0A6 }
+              - label: { x: 20, y: 60, text: "IP address", text_color: 0x9AA0A6 }
+              - label: { id: net_ip, align: TOP_RIGHT, x: -20, y: 60, text: "--" }
+              - label: { x: 20, y: 108, text: "Wi-Fi", text_color: 0x9AA0A6 }
+              - label: { id: net_ssid, align: TOP_RIGHT, x: -20, y: 108, text: "--" }
+              - label: { x: 20, y: 156, text: "Signal", text_color: 0x9AA0A6 }
+              - label: { id: net_signal, align: TOP_RIGHT, x: -20, y: 156, text: "--" }
+              - label: { x: 20, y: 204, text: "MAC", text_color: 0x9AA0A6 }
+              - label: { id: net_mac, align: TOP_RIGHT, x: -20, y: 204, text: "--", text_font: f_small }
+              - label: { x: 20, y: 252, text: "Home Assistant", text_color: 0x9AA0A6 }
+              - label: { id: net_ha, align: TOP_RIGHT, x: -20, y: 252, text: "--" }
+              - label: { x: 20, y: 300, text: "Firmware", text_color: 0x9AA0A6 }
+              - label: { id: net_fw, align: TOP_RIGHT, x: -20, y: 300, text: "--", text_font: f_small }
+
+        # ---- night schedule card (below the fold; swipe up) -------------
+        - obj:
+            x: 24
+            y: 472
+            width: 752
+            height: 214
+            bg_color: 0x171A20
+            bg_opa: COVER
+            radius: 16
+            scrollable: false
+            widgets:
+              - label:
+                  x: 20
+                  y: 18
+                  text: "NIGHT SCREEN OFF"
+                  text_font: f_small
+                  text_color: 0x9AA0A6
+              - switch:
+                  id: night_sw
+                  align: TOP_RIGHT
+                  x: -20
+                  y: 12
+                  width: 64
+                  height: 34
+                  bg_color: 0x22262E
+                  bg_opa: COVER
+                  indicator:
+                    checked:
+                      bg_color: 0x3B82F6
+                  knob:
+                    bg_color: 0xFFFFFF
+                  on_change:
+                    - lambda: "id(night_enabled) = x;"
+                    - script.execute: check_night
+              - label:
+                  x: 20
+                  y: 62
+                  text: "Off from"
+              - dropdown:
+                  id: night_start_dd
+                  x: 20
+                  y: 96
+                  width: 340
+                  height: 56
+                  options: ["12:00 AM", "12:30 AM", "1:00 AM", "1:30 AM", "2:00 AM", "2:30 AM", "3:00 AM", "3:30 AM", "4:00 AM", "4:30 AM", "5:00 AM", "5:30 AM", "6:00 AM", "6:30 AM", "7:00 AM", "7:30 AM", "8:00 AM", "8:30 AM", "9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM", "11:00 AM", "11:30 AM", "12:00 PM", "12:30 PM", "1:00 PM", "1:30 PM", "2:00 PM", "2:30 PM", "3:00 PM", "3:30 PM", "4:00 PM", "4:30 PM", "5:00 PM", "5:30 PM", "6:00 PM", "6:30 PM", "7:00 PM", "7:30 PM", "8:00 PM", "8:30 PM", "9:00 PM", "9:30 PM", "10:00 PM", "10:30 PM", "11:00 PM", "11:30 PM"]
+                  selected_index: 44
+                  styles: dd_style
+                  symbol: "\uF078"
+                  indicator:
+                    text_font: montserrat_18
+                    text_color: 0x9AA0A6
+                  dropdown_list:
+                    styles: dd_list_style
+                    selected:
+                      bg_color: 0x30353F
+                      checked:
+                        bg_color: 0x3B82F6
+                        text_color: 0xFFFFFF
+                  on_change:
+                    - lambda: "id(night_start_idx) = x;"
+                    - script.execute: check_night
+              - label:
+                  x: 392
+                  y: 62
+                  text: "Until"
+              - dropdown:
+                  id: night_end_dd
+                  x: 392
+                  y: 96
+                  width: 340
+                  height: 56
+                  options: ["12:00 AM", "12:30 AM", "1:00 AM", "1:30 AM", "2:00 AM", "2:30 AM", "3:00 AM", "3:30 AM", "4:00 AM", "4:30 AM", "5:00 AM", "5:30 AM", "6:00 AM", "6:30 AM", "7:00 AM", "7:30 AM", "8:00 AM", "8:30 AM", "9:00 AM", "9:30 AM", "10:00 AM", "10:30 AM", "11:00 AM", "11:30 AM", "12:00 PM", "12:30 PM", "1:00 PM", "1:30 PM", "2:00 PM", "2:30 PM", "3:00 PM", "3:30 PM", "4:00 PM", "4:30 PM", "5:00 PM", "5:30 PM", "6:00 PM", "6:30 PM", "7:00 PM", "7:30 PM", "8:00 PM", "8:30 PM", "9:00 PM", "9:30 PM", "10:00 PM", "10:30 PM", "11:00 PM", "11:30 PM"]
+                  selected_index: 12
+                  styles: dd_style
+                  symbol: "\uF078"
+                  indicator:
+                    text_font: montserrat_18
+                    text_color: 0x9AA0A6
+                  dropdown_list:
+                    styles: dd_list_style
+                    selected:
+                      bg_color: 0x30353F
+                      checked:
+                        bg_color: 0x3B82F6
+                        text_color: 0xFFFFFF
+                  on_change:
+                    - lambda: "id(night_end_idx) = x;"
+                    - script.execute: check_night
+              - label:
+                  x: 20
+                  y: 170
+                  width: 712
+                  long_mode: WRAP
+                  text: "Touch to turn the screen on. It goes off again after the screen saver delay (1 minute if set to Never)."
+                  text_font: f_small
+                  text_color: 0x5F6368
+
+    # =================================================================
+    #  Screen saver: room temperature bouncing around, dimmed to 10 %
+    # =================================================================
+    - id: saver_page
+      bg_color: 0x000000
+      bg_opa: COVER
+      scrollable: false
+      widgets:
+        - obj:
+            id: saver_box
+            x: 230
+            y: 155
+            width: 340
+            height: 170
+            clickable: false
+            scrollable: false
+            widgets:
+              - label:
+                  id: saver_temp
+                  align: TOP_MID
+                  text: "--"
+                  text_font: f_setpoint
+                  text_color: 0xE8EAED
+                  checked:
+                    text_color: 0x60A5FA    # cool
+                  user_1:
+                    text_color: 0xFB923C    # heat
+                  user_2:
+                    text_color: 0xC084FC    # auto
+                  user_3:
+                    text_color: 0x2DD4BF    # dry
+                  user_4:
+                    text_color: 0xCBD5E1    # fan
+              - label:
+                  id: saver_sub
+                  align: BOTTOM_MID
+                  text: "Off"
+                  text_color: 0x9AA0A6

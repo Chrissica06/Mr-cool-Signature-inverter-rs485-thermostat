@@ -1,0 +1,40 @@
+# Today's forecast high/low for the thermostat panel, from the
+# Wunderground PWS integration (weather.kohlanca157).
+#
+# Add to Home Assistant's configuration.yaml (merge into an existing
+# `template:` section if you have one), then Developer tools → YAML →
+# Check configuration → Restart.
+#
+# Wunderground blanks today's high after about 3 pm local time. When that
+# happens the sensor keeps the value it already had, instead of going to
+# "unknown", so the panel keeps showing the day's high.
+template:
+  - triggers:
+      - trigger: time_pattern
+        minutes: /30
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: weather.get_forecasts
+        data:
+          type: daily
+        target:
+          entity_id: weather.kohlanca157
+        response_variable: daily
+    sensor:
+      - name: Forecast Today High
+        unique_id: forecast_today_high
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state: >
+          {% set f = daily['weather.kohlanca157'].forecast %}
+          {% set t = f[0].temperature if f | count > 0 else none %}
+          {{ t if t is not none else this.state }}
+      - name: Forecast Today Low
+        unique_id: forecast_today_low
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state: >
+          {% set f = daily['weather.kohlanca157'].forecast %}
+          {% set t = f[0].templow if f | count > 0 else none %}
+          {{ t if t is not none else this.state }}
